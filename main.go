@@ -1,169 +1,152 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+    "os"
+	"flag"
 	"log"
-	"net"
-	"os"
-	"plugin"
-	"strings"
 	"sync"
+	"encoding/json"
+	"github.com/vmihailenco/msgpack/v5"
+	"os/signal"
+	"syscall"
 )
 
-var ErrorLog = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile)
+var ErrorLog = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime)
+var NoticeLog = log.New(os.Stderr, "NOTICE: ", log.Ldate|log.Ltime)
+var configPath = flag.String("config", "config.json", "path to config file")
+var config *Config
+var wg sync.WaitGroup
 
-type JSONRPCRequest struct {
-	Method string                 `json:"method"`
-	Params map[string]interface{} `json:"params"`
-	Id     *int                   `json:"id"`
+// Serializer - интерфейс для сериализации и десериализации данных.
+type Serializer interface {
+    Marshal(v interface{}) ([]byte, error)
+    Unmarshal(data []byte, v interface{}) error
 }
 
-type JSONRPCResponse struct {
-	Result interface{} `json:"result,omitempty"`
-	Error  *RPCError   `json:"error,omitempty"`
-	Id     *int        `json:"id"`
+// JSONSerializer - реализация сериализатора для JSON.
+type JSONSerializer struct{}
+
+func (js JSONSerializer) Marshal(v interface{}) ([]byte, error) {
+    return json.Marshal(v)
 }
 
-type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+func (js JSONSerializer) Unmarshal(data []byte, v interface{}) error {
+    return json.Unmarshal(data, v)
+}
+
+// MsgPackSerializer - реализация сериализатора для MessagePack.
+type MsgPackSerializer struct{}
+
+func (mps MsgPackSerializer) Marshal(v interface{}) ([]byte, error) {
+    return msgpack.Marshal(v)
+}
+
+func (mps MsgPackSerializer) Unmarshal(data []byte, v interface{}) error {
+    return msgpack.Unmarshal(data, v)
 }
 
 func main() {
-	listener, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		panic(err)
-	}
-	defer listener.Close()
+	flag.Parse()
+    config = LoadConfig(*configPath)
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			ErrorLog.Println(err)
-			continue
-		}
+    if config == nil {
+        ErrorLog.Fatal("Failed to load configuration")
+    }
 
-		go handler(conn)
+    rpc.init()
+
+    // Обработка сигнала SIGHUP
+    sighupChan := make(chan os.Signal, 1)
+    signal.Notify(sighupChan, syscall.SIGHUP)
+
+    go func() {
+        for {
+            select {
+            case <-sighupChan:
+                // Перезагрузите методы или конфигурацию
+                NoticeLog.Println("Received SIGHUP, reinitializing methods.")
+                rpc.init() // Предполагается, что rpc.init() переинициализирует методы.
+            }
+        }
+    }()
+
+    requestQueue = make(chan Request, config.Server.MaxRequests)
+
+	if config.Server.Protocol == "tcp" {
+	    go TCPServer()
+	} else if config.Server.Protocol == "http" {
+	    go HTTPServer()
 	}
+
+	for i := 0; i < config.Server.MaxWorkers; i++ {
+        wg.Add(1)
+        go requestHandler(i)
+    }
+
+    wg.Wait()
 }
 
-func handler(conn net.Conn) {
-	reader := bufio.NewReader(conn)
-	defer conn.Close()
+func requestHandler(i int) {
+    defer func() {
+        if r := recover(); r != nil {
+            NoticeLog.Printf("Recovered in requestHandler %d: %v", i, r)
+        }
+    }()
 
-	for {
-		message, err := reader.ReadString('\n')
-		if err != nil {
-			ErrorLog.Println(err)
-			return
-		}
+    for req := range requestQueue {
+        var response []byte
+        var serializer Serializer
 
-		// Определение, является ли запрос batch-запросом
-		var data json.RawMessage
-		if err := json.Unmarshal([]byte(message), &data); err != nil {
-			sendErrorResponse(conn, -32700, "Parse error", nil)
-			continue
-		}
+        switch config.Server.Format {
+            case "JSON":
+                serializer = JSONSerializer{}
+            case "MessagePack":
+                serializer = MsgPackSerializer{}
+        }
 
-		// Попытка десериализации batch-запроса
-		var batch []JSONRPCRequest
-		if err := json.Unmarshal(data, &batch); err == nil {
-			handleBatchRequest(conn, batch)
-			continue
-		}
+        var raw interface{}
+        ErrorLog.Printf("%s", req.Data)
 
-		// Попытка десериализации одиночного запроса
-		var singleRequest JSONRPCRequest
-		if err := json.Unmarshal(data, &singleRequest); err == nil {
-			handleSingleRequest(conn, singleRequest)
-			continue
-		}
+        if err := serializer.Unmarshal([]byte(req.Data), &raw); err != nil {
+            ErrorLog.Printf("%s", err)
+            response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32700, "Parse error"}})
+        } else {
+            // Определение, является ли raw массивом или объектом
+            switch raw.(type) {
+            case []interface{}:
+                // Обрабатываем как батч запрос
+                var requests []RPCRequest
+                if err := serializer.Unmarshal([]byte(req.Data), &requests); err != nil {
+                    response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32600, "Invalid Batch Request"}})
+                }
 
-		sendErrorResponse(conn, -32600, "Invalid Request", nil)
-	}
-}
+                var wg sync.WaitGroup
+                responses := make([]RPCResponse, len(requests))
 
-func handleBatchRequest(conn net.Conn, requests []JSONRPCRequest) {
-	var wg sync.WaitGroup
-	responses := make([]JSONRPCResponse, len(requests))
+                // Создаем горутину для каждого запроса в батче
+                for i, req := range requests {
+                    wg.Add(1)
+                    go func(index int, request RPCRequest) {
+                        defer wg.Done()
+                        responses[index] = *rpc.handle(request)
+                    }(i, req)
+                }
 
-	for i, req := range requests {
-		wg.Add(1)
-		go func(index int, request JSONRPCRequest) {
-			defer wg.Done()
-			response := callMethod(request.Method, &request.Params)
-			response.Id = request.Id
-			responses[index] = response
-		}(i, req)
-	}
+                wg.Wait()
 
-	wg.Wait()
+                response, _ = serializer.Marshal(responses)
 
-	// Отфильтровываем пустые ответы для уведомлений (notifications)
-	var nonEmptyResponses []JSONRPCResponse
-	for _, resp := range responses {
-		if resp.Id != nil { // Уведомления не имеют id
-			nonEmptyResponses = append(nonEmptyResponses, resp)
-		}
-	}
+            case map[string]interface{}:
+                // Обрабатываем как одиночный запрос
+                var request RPCRequest
+                if err := serializer.Unmarshal([]byte(req.Data), &request); err != nil {
+                    response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32600, "Invalid Request"}})
+                } else {
+                    response, _ = serializer.Marshal(rpc.handle(request))
+                }
+            }
+        }
 
-	responseJSON, err := json.Marshal(nonEmptyResponses)
-	if err != nil {
-		ErrorLog.Println("Ошибка при маршалинге ответа:", err)
-		return
-	}
-
-	conn.Write(responseJSON)
-	conn.Write([]byte("\n"))
-}
-
-func handleSingleRequest(conn net.Conn, request JSONRPCRequest) {
-	response := callMethod(request.Method, &request.Params)
-	response.Id = request.Id
-	responseJSON, err := json.Marshal([]JSONRPCResponse{response}) // Оборачиваем в массив для соответствия JSON-RPC
-	if err != nil {
-		ErrorLog.Println("Ошибка при маршалинге ответа:", err)
-		return
-	}
-
-	conn.Write(responseJSON)
-	conn.Write([]byte("\n"))
-}
-
-func callMethod(method string, params *map[string]interface{}) JSONRPCResponse {
-	path := "./methods/" + strings.Replace(method, ".", "/", -1) + ".so"
-
-	p, err := plugin.Open(path)
-	if err != nil {
-		return JSONRPCResponse{Error: &RPCError{-32601, "Method not found"}}
-	}
-
-	symbol, err := p.Lookup("Do")
-	if err != nil {
-		ErrorLog.Println(err)
-		return JSONRPCResponse{Error: &RPCError{-32601, "Method not found"}}
-	}
-
-	exportedFunc, ok := symbol.(func(map[string]interface{}) interface{})
-	if !ok {
-		ErrorLog.Println("Method", method, "is broken or has incorrect signature")
-		return JSONRPCResponse{Error: &RPCError{-32601, "Method not found"}}
-	}
-
-	result := exportedFunc(*params)
-	return JSONRPCResponse{Result: result}
-}
-
-func sendErrorResponse(conn net.Conn, code int, message string, id *int) {
-	resp := JSONRPCResponse{
-		Error: &RPCError{
-			Code:    code,
-			Message: message,
-		},
-		Id: id,
-	}
-	respJSON, _ := json.Marshal(resp)
-	conn.Write(respJSON)
-	conn.Write([]byte("\n"))
+        req.Response(string(response))
+    }
 }
