@@ -16,6 +16,9 @@ type Config struct {
 		MaxWorkers int    `json:"max_workers"`
 		MaxRequests int    `json:"max_requests"`
 	}
+	Authorization struct {
+	    SecretKey   string `json:"secret_key"`
+	}
 }
 
 func LoadConfig(filename string) (*Config) {

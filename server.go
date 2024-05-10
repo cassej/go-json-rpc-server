@@ -5,12 +5,15 @@ import (
     "bufio"
     "net/http"
     "io/ioutil"
+    "strings"
 )
 
 type Request struct {
 	Data    string      // Содержимое запроса
+	Token   string      // Авторизационный токен
 	Conn    net.Conn    // Соединение TCP, может быть nil для HTTP
 	Writer  http.ResponseWriter // Writer для HTTP, может быть nil для TCP
+	Done    chan bool
 }
 
 func (r *Request) Response(message string) {
@@ -22,13 +25,14 @@ func (r *Request) Response(message string) {
         }
     } else if r.Writer != nil {
         // Обработка HTTP ответа
-        messageBytes := []byte(message)
-
-        if _, err := r.Writer.Write(messageBytes); err != nil {
-            ErrorLog.Printf("Failed to write HTTP response: %v", err)
+        _, err := r.Writer.Write([]byte(message))
+        if err != nil {
+            ErrorLog.Printf("Failed to write to HTTP connection: %v", err)
         }
     }
+    r.Done <- true
 }
+
 
 var requestQueue chan Request
 
@@ -76,6 +80,10 @@ func HTTPServer () {
             return
         }
 
+        authHeader := r.Header.Get("Authorization")
+
+        token := strings.TrimPrefix(authHeader, "Bearer ")
+
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
@@ -84,10 +92,14 @@ func HTTPServer () {
 		if len(body) < 1 {
             http.Error(w, "Bad Request: Body is empty", http.StatusBadRequest)
             return
-		} else {
-            requestQueue <- Request{Data: string(body), Writer: w}
-            return
 		}
+
+        w.Header().Set("Content-Type", "application/json")
+        done := make(chan bool, 1)
+        wg.Add(1)
+        requestQueue <- Request{Token: token, Data: string(body), Writer: w, Done: done}
+        <-done
+        wg.Done()
 	})
 
 	address := config.Server.Host + ":" + config.Server.Port

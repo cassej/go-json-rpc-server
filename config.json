@@ -1,10 +1,13 @@
 {
   "server": {
-    "protocol": "tcp",
+    "protocol": "http",
     "host": "0.0.0.0",
     "port": "8080",
     "max_workers": 40,
     "max_requests": 4096,
     "format": "JSON"
+  },
+  "authorization": {
+    "secret_key": "your-secret-key-goes-here"
   }
 }

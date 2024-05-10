@@ -4,6 +4,7 @@ import (
     "plugin"
     "path/filepath"
     "os"
+    "github.com/golang-jwt/jwt/v5"
     "strings"
 )
 
@@ -11,12 +12,13 @@ type Method struct {
     Name        string
     //Contract    func() (Contract, error)  // Загружает структуру контракта
     //Validate    func(params map[string]interface{}) error // Валидирует параметры
-    Execute     func(params map[string]interface{}) (interface{}) // Выполняет метод
+    Execute     func(params map[string]interface{}, user map[string]interface{}) (interface{}) // Выполняет метод
 }
 
 var methods map[string]Method
 
 type RPCRequest struct {
+    Token  string                 `json:"token,omitempty"`
 	Method string                 `json:"method"`
 	Params map[string]interface{} `json:"params"`
 	Id     *int                   `json:"id"`
@@ -63,7 +65,7 @@ func (r RPC) init() {
 
         methods[methodName] = Method{
             Name:            methodName,
-            Execute:         execute.(func(map[string]interface{}) (interface{}))}
+            Execute:         execute.(func(map[string]interface{},map[string]interface{}) (interface{}))}
 
         return nil
     })
@@ -73,9 +75,26 @@ func (r RPC) init() {
     }
 }
 
+func (r RPC) getAuth(tokenString string) (map[string]interface{}) {
+    user := map[string]interface{}{"role": "public"}
+
+    keyFunc := func(token *jwt.Token) (interface{}, error) {
+        return []byte(config.Authorization.SecretKey), nil
+    }
+
+    token, err := jwt.Parse(tokenString, keyFunc)
+    if err == nil {
+        if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+            return claims
+        }
+    }
+
+    return user
+}
+
 func (r RPC) handle(request RPCRequest) *RPCResponse {
     if method, ok := methods[request.Method]; ok {
-        return &RPCResponse{Id: request.Id, Result: method.Execute(request.Params)}
+        return &RPCResponse{Id: request.Id, Result: method.Execute(request.Params, r.getAuth(request.Token))}
     }
 
     return &RPCResponse{Id: request.Id, Error: &RPCError{-32601, "Method not found"}}

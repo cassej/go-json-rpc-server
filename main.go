@@ -63,9 +63,8 @@ func main() {
         for {
             select {
             case <-sighupChan:
-                // Перезагрузите методы или конфигурацию
                 NoticeLog.Println("Received SIGHUP, reinitializing methods.")
-                rpc.init() // Предполагается, что rpc.init() переинициализирует методы.
+                rpc.init()
             }
         }
     }()
@@ -105,7 +104,6 @@ func requestHandler(i int) {
         }
 
         var raw interface{}
-        ErrorLog.Printf("%s", req.Data)
 
         if err := serializer.Unmarshal([]byte(req.Data), &raw); err != nil {
             ErrorLog.Printf("%s", err)
@@ -124,12 +122,16 @@ func requestHandler(i int) {
                 responses := make([]RPCResponse, len(requests))
 
                 // Создаем горутину для каждого запроса в батче
-                for i, req := range requests {
+                for i, subreq := range requests {
                     wg.Add(1)
                     go func(index int, request RPCRequest) {
                         defer wg.Done()
+                        if len(req.Token) > 0 && len(request.Token) == 0 {
+                            request.Token = req.Token
+                        }
+
                         responses[index] = *rpc.handle(request)
-                    }(i, req)
+                    }(i, subreq)
                 }
 
                 wg.Wait()
@@ -142,6 +144,10 @@ func requestHandler(i int) {
                 if err := serializer.Unmarshal([]byte(req.Data), &request); err != nil {
                     response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32600, "Invalid Request"}})
                 } else {
+                    if len(req.Token) > 0 && len(request.Token) == 0 {
+                        request.Token = req.Token
+                    }
+
                     response, _ = serializer.Marshal(rpc.handle(request))
                 }
             }
