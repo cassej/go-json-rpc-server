@@ -1,14 +1,21 @@
 package main
 
 import (
+    "context"
+    "encoding/json"
+    "expvar"
+    "flag"
+    "fmt"
+    "log"
+    "net/http"
     "os"
-	"flag"
-	"log"
-	"sync"
-	"encoding/json"
-	"github.com/vmihailenco/msgpack/v5"
-	"os/signal"
-	"syscall"
+    "os/signal"
+    "runtime"
+    "sync"
+    "syscall"
+    "time"
+
+    "github.com/vmihailenco/msgpack/v5"
 )
 
 var ErrorLog = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime)
@@ -17,13 +24,22 @@ var configPath = flag.String("config", "config.json", "path to config file")
 var config *Config
 var wg sync.WaitGroup
 
-// Serializer - интерфейс для сериализации и десериализации данных.
+var (
+    requestCount = expvar.NewInt("requestCount")
+    errorCount   = expvar.NewInt("errorCount")
+)
+
+func init() {
+    expvar.Publish("goroutines", expvar.Func(func() interface{} {
+        return runtime.NumGoroutine()
+    }))
+}
+
 type Serializer interface {
     Marshal(v interface{}) ([]byte, error)
     Unmarshal(data []byte, v interface{}) error
 }
 
-// JSONSerializer - реализация сериализатора для JSON.
 type JSONSerializer struct{}
 
 func (js JSONSerializer) Marshal(v interface{}) ([]byte, error) {
@@ -34,7 +50,6 @@ func (js JSONSerializer) Unmarshal(data []byte, v interface{}) error {
     return json.Unmarshal(data, v)
 }
 
-// MsgPackSerializer - реализация сериализатора для MessagePack.
 type MsgPackSerializer struct{}
 
 func (mps MsgPackSerializer) Marshal(v interface{}) ([]byte, error) {
@@ -46,7 +61,7 @@ func (mps MsgPackSerializer) Unmarshal(data []byte, v interface{}) error {
 }
 
 func main() {
-	flag.Parse()
+    flag.Parse()
     config = LoadConfig(*configPath)
 
     if config == nil {
@@ -55,104 +70,194 @@ func main() {
 
     rpc.init()
 
-    // Обработка сигнала SIGHUP
     sighupChan := make(chan os.Signal, 1)
+    stopChan := make(chan os.Signal, 1)
     signal.Notify(sighupChan, syscall.SIGHUP)
-
-    go func() {
-        for {
-            select {
-            case <-sighupChan:
-                NoticeLog.Println("Received SIGHUP, reinitializing methods.")
-                rpc.init()
-            }
-        }
-    }()
+    signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
 
     requestQueue = make(chan Request, config.Server.MaxRequests)
 
-	if config.Server.Protocol == "tcp" {
-	    go TCPServer()
-	} else if config.Server.Protocol == "http" {
-	    go HTTPServer()
-	}
+    // Создаем контекст с возможностью отмены
+    ctx, cancel := context.WithCancel(context.Background())
 
-	for i := 0; i < config.Server.MaxWorkers; i++ {
-        wg.Add(1)
-        go requestHandler(i)
+    // Запускаем серверы
+    var httpServer *http.Server
+    if config.Server.Protocol == "tcp" {
+        go TCPServer(ctx)
+    } else if config.Server.Protocol == "http" {
+        httpServer = HTTPServer()
+        go func() {
+            if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+                ErrorLog.Printf("HTTP server error: %v", err)
+            }
+        }()
     }
 
-    wg.Wait()
-}
-
-func requestHandler(i int) {
-    defer func() {
-        if r := recover(); r != nil {
-            NoticeLog.Printf("Recovered in requestHandler %d: %v", i, r)
+    // Запускаем сервер метрик
+    metricsServer := &http.Server{Addr: ":8080"}
+    go func() {
+        if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            ErrorLog.Printf("Metrics server error: %v", err)
         }
     }()
 
-    for req := range requestQueue {
-        var response []byte
-        var serializer Serializer
+    // Создаем пул воркеров
+    workerPool := make(chan struct{}, config.Server.MaxWorkers)
+    for i := 0; i < config.Server.MaxWorkers; i++ {
+        workerPool <- struct{}{}
+    }
 
-        switch config.Server.Format {
-            case "JSON":
-                serializer = JSONSerializer{}
-            case "MessagePack":
-                serializer = MsgPackSerializer{}
-        }
-
-        var raw interface{}
-
-        if err := serializer.Unmarshal([]byte(req.Data), &raw); err != nil {
-            ErrorLog.Printf("%s", err)
-            response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32700, "Parse error"}})
-        } else {
-            // Определение, является ли raw массивом или объектом
-            switch raw.(type) {
-            case []interface{}:
-                // Обрабатываем как батч запрос
-                var requests []RPCRequest
-                if err := serializer.Unmarshal([]byte(req.Data), &requests); err != nil {
-                    response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32600, "Invalid Batch Request"}})
-                }
-
-                var wg sync.WaitGroup
-                responses := make([]RPCResponse, len(requests))
-
-                // Создаем горутину для каждого запроса в батче
-                for i, subreq := range requests {
-                    wg.Add(1)
-                    go func(index int, request RPCRequest) {
-                        defer wg.Done()
-                        if len(req.Token) > 0 && len(request.Token) == 0 {
-                            request.Token = req.Token
-                        }
-
-                        responses[index] = *rpc.handle(request)
-                    }(i, subreq)
-                }
-
-                wg.Wait()
-
-                response, _ = serializer.Marshal(responses)
-
-            case map[string]interface{}:
-                // Обрабатываем как одиночный запрос
-                var request RPCRequest
-                if err := serializer.Unmarshal([]byte(req.Data), &request); err != nil {
-                    response, _ = serializer.Marshal(RPCResponse{Error: &RPCError{-32600, "Invalid Request"}})
-                } else {
-                    if len(req.Token) > 0 && len(request.Token) == 0 {
-                        request.Token = req.Token
-                    }
-
-                    response, _ = serializer.Marshal(rpc.handle(request))
-                }
+    // Запускаем обработку запросов
+    go func() {
+        for {
+            select {
+            case req := <-requestQueue:
+                <-workerPool // Получаем доступный воркер
+                go func(req Request) {
+                    defer func() {
+                        workerPool <- struct{}{} // Возвращаем воркер в пул
+                    }()
+                    handleRequest(req)
+                }(req)
+            case <-ctx.Done():
+                return
             }
         }
+    }()
 
-        req.Response(string(response))
+    // Ожидаем сигналы
+    for {
+        select {
+        case <-sighupChan:
+            NoticeLog.Println("Received SIGHUP, reinitializing methods.")
+            rpc.init()
+        case <-stopChan:
+            NoticeLog.Println("Received stop signal, shutting down...")
+
+            // Отменяем контекст, чтобы остановить обработку новых запросов
+            cancel()
+
+            // Закрываем каналы
+            close(requestQueue)
+            close(workerPool)
+
+            // Ожидаем завершения текущих запросов (можно добавить таймаут)
+            time.Sleep(5 * time.Second)
+
+            // Останавливаем HTTP-сервер, если он запущен
+            if httpServer != nil {
+                shutdownCtx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+                if err := httpServer.Shutdown(shutdownCtx); err != nil {
+                    ErrorLog.Printf("HTTP server shutdown error: %v", err)
+                }
+            }
+
+            // Останавливаем сервер метрик
+            shutdownCtx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+            if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+                ErrorLog.Printf("Metrics server shutdown error: %v", err)
+            }
+
+            NoticeLog.Println("Shutdown complete")
+            os.Exit(0)
+        }
     }
+}
+
+func handleRequest(req Request) {
+    requestCount.Add(1)
+    var response []byte
+    var serializer Serializer
+
+    switch config.Server.Format {
+    case "JSON":
+        serializer = JSONSerializer{}
+    case "MessagePack":
+        serializer = MsgPackSerializer{}
+    }
+
+    raw, err := deserializeRequest(serializer, []byte(req.Data))
+    if err != nil {
+        ErrorLog.Printf("%s", err)
+        errorCount.Add(1)
+        response, _ = serializeResponse(serializer, RPCResponse{Error: &RPCError{-32700, "Parse error"}})
+    } else if err := validateRPCRequest(raw); err != nil {
+        ErrorLog.Printf("Invalid request: %s", err)
+        errorCount.Add(1)
+        response, _ = serializeResponse(serializer, RPCResponse{Error: &RPCError{-32600, "Invalid Request"}})
+    } else {
+        switch raw.(type) {
+        case []interface{}:
+            // Обрабатываем как батч запрос
+            var requests []RPCRequest
+            if err := serializer.Unmarshal([]byte(req.Data), &requests); err != nil {
+                response, _ = serializeResponse(serializer, RPCResponse{Error: &RPCError{-32600, "Invalid Batch Request"}})
+            }
+
+            responses := make([]RPCResponse, len(requests))
+
+            for i, subreq := range requests {
+                if len(req.Token) > 0 && len(subreq.Token) == 0 {
+                    subreq.Token = req.Token
+                }
+                responses[i] = *rpc.handle(subreq)
+            }
+
+            response, _ = serializeResponse(serializer, responses)
+
+        case map[string]interface{}:
+            // Обрабатываем как одиночный запрос
+            var request RPCRequest
+            if err := serializer.Unmarshal([]byte(req.Data), &request); err != nil {
+                response, _ = serializeResponse(serializer, RPCResponse{Error: &RPCError{-32600, "Invalid Request"}})
+            } else {
+                if len(req.Token) > 0 && len(request.Token) == 0 {
+                    request.Token = req.Token
+                }
+                response, _ = serializeResponse(serializer, rpc.handle(request))
+            }
+        }
+    }
+
+    req.Response(string(response))
+}
+
+func validateRPCRequest(raw interface{}) error {
+    switch v := raw.(type) {
+    case []interface{}:
+        for _, item := range v {
+            if err := validateRPCRequestItem(item); err != nil {
+                return err
+            }
+        }
+    case map[string]interface{}:
+        return validateRPCRequestItem(v)
+    default:
+        return fmt.Errorf("invalid request format")
+    }
+    return nil
+}
+
+func validateRPCRequestItem(item interface{}) error {
+    req, ok := item.(map[string]interface{})
+    if !ok {
+        return fmt.Errorf("invalid request item format")
+    }
+    if _, ok := req["method"]; !ok {
+        return fmt.Errorf("method is required")
+    }
+    if _, ok := req["params"]; !ok {
+        return fmt.Errorf("params are required")
+    }
+    return nil
+}
+
+func serializeResponse(serializer Serializer, resp interface{}) ([]byte, error) {
+    return serializer.Marshal(resp)
+}
+
+func deserializeRequest(serializer Serializer, data []byte) (interface{}, error) {
+    var raw interface{}
+    err := serializer.Unmarshal(data, &raw)
+    return raw, err
 }

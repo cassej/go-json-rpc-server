@@ -1,30 +1,30 @@
 package main
 
 import (
-    "net"
     "bufio"
-    "net/http"
     "io/ioutil"
+    "net"
+    "net/http"
     "strings"
+    "time"
+    "context"
 )
 
 type Request struct {
-	Data    string      // Содержимое запроса
-	Token   string      // Авторизационный токен
-	Conn    net.Conn    // Соединение TCP, может быть nil для HTTP
-	Writer  http.ResponseWriter // Writer для HTTP, может быть nil для TCP
-	Done    chan bool
+    Data   string
+    Token  string
+    Conn   net.Conn
+    Writer http.ResponseWriter
+    Done   chan bool
 }
 
 func (r *Request) Response(message string) {
     if r.Conn != nil {
-        // Обработка TCP соединения
         _, err := r.Conn.Write([]byte(message + "\n"))
         if err != nil {
             ErrorLog.Printf("Failed to write to TCP connection: %v", err)
         }
     } else if r.Writer != nil {
-        // Обработка HTTP ответа
         _, err := r.Writer.Write([]byte(message))
         if err != nil {
             ErrorLog.Printf("Failed to write to HTTP connection: %v", err)
@@ -33,79 +33,102 @@ func (r *Request) Response(message string) {
     r.Done <- true
 }
 
-
 var requestQueue chan Request
 
-func TCPServer () {
+func TCPServer(ctx context.Context) {
     address := config.Server.Host + ":" + config.Server.Port
-	listener, err := net.Listen("tcp", address)
+    listener, err := net.Listen("tcp", address)
 
-	if err != nil {
-		ErrorLog.Fatal("Failed to start TCP server on %s: %v", address, err)
-	}
+    if err != nil {
+        ErrorLog.Fatalf("Failed to start TCP server on %s: %v", address, err)
+    }
 
-	defer listener.Close()
+    defer listener.Close()
 
-	NoticeLog.Printf("TCP server listening on %s", address)
+    NoticeLog.Printf("TCP server listening on %s", address)
+
+    go func() {
+        <-ctx.Done()
+        listener.Close()
+    }()
+
     for {
         conn, err := listener.Accept()
         if err != nil {
+            if ctx.Err() != nil {
+                return  // Сервер завершает работу
+            }
             ErrorLog.Printf("Failed to accept connection: %v", err)
             continue
         }
 
-
-        defer conn.Close()
-            reader := bufio.NewReader(conn)
-
-            for {
-                message, err := reader.ReadString('\n')  // Считывание до символа новой строки
-                if err != nil {
-                    ErrorLog.Printf("Failed to read from connection: %v", err)
-                }
-
-                if message == "" {
-                    continue  // Пропускаем пустые сообщения
-                }
-
-                requestQueue <- Request{Data: message, Conn: conn}
-            }
+        go handleTCPConnection(conn)
     }
 }
 
-func HTTPServer () {
-    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        if r.Method != "POST" {
-            http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+func HTTPServer() *http.Server {
+    server := &http.Server{
+        Addr:         config.Server.Host + ":" + config.Server.Port,
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
+        Handler:      http.HandlerFunc(handleHTTP),
+    }
+
+    return server
+}
+
+func handleTCPConnection(conn net.Conn) {
+    defer conn.Close()
+    reader := bufio.NewReader(conn)
+
+    for {
+        err := conn.SetDeadline(time.Now().Add(5 * time.Minute))
+        if err != nil {
+            ErrorLog.Printf("Failed to set deadline: %v", err)
             return
         }
 
-        authHeader := r.Header.Get("Authorization")
-
-        token := strings.TrimPrefix(authHeader, "Bearer ")
-
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-			return
-		}
-		if len(body) < 1 {
-            http.Error(w, "Bad Request: Body is empty", http.StatusBadRequest)
+        message, err := reader.ReadString('\n')
+        if err != nil {
+            if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                ErrorLog.Printf("Connection timeout")
+            } else {
+                ErrorLog.Printf("Failed to read from connection: %v", err)
+            }
             return
-		}
+        }
 
-        w.Header().Set("Content-Type", "application/json")
-        done := make(chan bool, 1)
-        wg.Add(1)
-        requestQueue <- Request{Token: token, Data: string(body), Writer: w, Done: done}
-        <-done
-        wg.Done()
-	})
+        if message == "" {
+            continue
+        }
 
-	address := config.Server.Host + ":" + config.Server.Port
-	NoticeLog.Printf("HTTP server listening on %s", address)
+        requestQueue <- Request{Data: message, Conn: conn}
+    }
+}
 
-	if err := http.ListenAndServe(address, nil); err != nil {
-		ErrorLog.Printf("Failed to start HTTP server on %s: %v", address, err)
-	}
+func handleHTTP(w http.ResponseWriter, r *http.Request) {
+    if r.Method != "POST" {
+        http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    authHeader := r.Header.Get("Authorization")
+    token := strings.TrimPrefix(authHeader, "Bearer ")
+
+    body, err := ioutil.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+        return
+    }
+    if len(body) < 1 {
+        http.Error(w, "Bad Request: Body is empty", http.StatusBadRequest)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    done := make(chan bool, 1)
+    wg.Add(1)
+    requestQueue <- Request{Token: token, Data: string(body), Writer: w, Done: done}
+    <-done
+    wg.Done()
 }

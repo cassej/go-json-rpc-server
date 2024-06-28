@@ -2,7 +2,7 @@
   "server": {
     "protocol": "http",
     "host": "0.0.0.0",
-    "port": "8080",
+    "port": "8081",
     "max_workers": 40,
     "max_requests": 4096,
     "format": "JSON"
